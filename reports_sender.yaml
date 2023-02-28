@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates an infrastructure for automatically sending reports from S3 to email addresses
+Parameters:
+  BucketName:
+    Description: S3 Bucket name
+    Type: String
+    Default: reports-sender-1997
+  SenderEmail:
+    Type: String
+    Default: nowart97@gmail.com
+  Recipients:
+    Type: String
+    Default: nowart97@gmail.com
+  EmailSubject:
+    Type: String
+    Default: Reports
+  Region:
+    Type: String
+    Default: eu-central-1
+  LogRetentionInDays:
+    Type: String
+    Default: 7
+
+Resources:
+  ReportsS3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: S3InvokeLambdaPermission
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ReportsSenderLambdaFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ReportsSenderLambdaFunction.Arn
+      SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+      SourceAccount: !Ref "AWS::AccountId"
+      Principal: s3.amazonaws.com
+  LambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: LambdaFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+  ReportsSenderLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Environment:
+        Variables:
+          SENDER: !Ref SenderEmail
+          EMAIL_SUBJECT: !Ref EmailSubject
+          RECIPIENTS: !Ref Recipients
+          REGION: !Ref Region
+          BUCKET_NAME: !Ref BucketName
+      Code:
+        ZipFile: |
+          import os.path
+          import json
+          import urllib.parse
+          import boto3
+          import email
+          import cfnresponse
+          from botocore.exceptions import ClientError
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.application import MIMEApplication
+
+          print('Loading function')
+
+          SENDER = os.environ['SENDER']
+          EMAIL_SUBJECT = os.environ['EMAIL_SUBJECT']
+          RECIPIENTS = os.environ['RECIPIENTS'].split(",")
+          REGION = os.environ['REGION']
+          BUCKET = os.environ['BUCKET_NAME']
+
+          s3 = boto3.client('s3')
+
+          def clear_bucket():
+              s3.Bucket(BUCKET).objects.all().delete()
+              print("Successfully cleared bucket: " + BUCKET)
+
+          def download_report(event):
+              KEY = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              fileName = os.path.basename(KEY)
+              tmpFileName = '/tmp/' +fileName
+              s3.download_file(BUCKET, KEY, tmpFileName)
+              print("Successfully downloaded the report from bucket: " + BUCKET)
+              return tmpFileName
+
+          def send_report(sender, recipient, aws_region, subject, file_name):
+              BODY_TEXT = "Hello,\r\nPlease find the attached report."
+              BODY_HTML = """\
+              <html>
+              <head></head>
+              <body>
+              <h1>Hello</h1>
+              <p>Please find the attached report.</p>
+              </body>
+              </html>
+              """
+              CHARSET = "utf-8"
+              client = boto3.client('ses',region_name=aws_region)
+              msg = MIMEMultipart('mixed')
+              msg['Subject'] = subject 
+              msg['From'] = sender 
+              msg['To'] = recipient
+              msg_body = MIMEMultipart('alternative')
+              textpart = MIMEText(BODY_TEXT.encode(CHARSET), 'plain', CHARSET)
+              htmlpart = MIMEText(BODY_HTML.encode(CHARSET), 'html', CHARSET)
+              msg_body.attach(textpart)
+              msg_body.attach(htmlpart)
+              att = MIMEApplication(open(file_name, 'rb').read())
+              att.add_header('Content-Disposition','attachment', filename="report.csv")
+              if os.path.exists(file_name):
+                  print("File: " + file_name + " exists")
+                  msg.attach(msg_body)
+                  msg.attach(att)
+                  client.send_raw_email(
+                          Source=msg['From'],
+                          Destinations=[
+                              msg['To']
+                          ],
+                          RawMessage={
+                              'Data':msg.as_string(),
+                          }
+                      )
+                  print('Reports sent successfully')
+              else:
+                  message = "File: " + file_name + " does not exist"
+                  print(message)
+                  raise Exception(message)
+
+          def lambda_handler(event, context):
+              responseData = {}
+              attachment = {}
+              if 'RequestType' in event:
+                  try:
+                      if event['RequestType'] == 'Delete':
+                          clear_bucket()
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                  except Exception as e:
+                      print('Exception when setting up the infrastructure')
+                      print(e)
+                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+              try:
+                  attachment = download_report(event)
+              except Exception as e:
+                  print('Exception when fetching report from bucket')
+                  print(e)
+              try:
+                  for recipient in RECIPIENTS:
+                      send_report(SENDER, recipient, REGION, EMAIL_SUBJECT, attachment)
+              except Exception as e:
+                  print('Exception when sending reports')
+                  print(e)
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ReportsSenderLambdaFunction}"
+      RetentionInDays: !Ref LogRetentionInDays
+  LambdaLogPermissions:
+    Type: AWS::IAM::Policy
+    DependsOn: ReportsSenderLambdaFunction
+    Properties:
+      Roles:
+        - !Ref LambdaFunctionRole
+      PolicyName: !Sub "${AWS::Region}-LambdaLogGroup"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ReportsSenderLambdaFunction}"
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ReportsSenderLambdaFunction}:*"
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ReportsSenderLambdaFunction}:*:*"
