@@ -7,10 +7,10 @@ Parameters:
     Default: reports-sender-1997
   SenderEmail:
     Type: String
-    Default: nowart97@gmail.com
+    Default: email@gmail.com
   Recipients:
     Type: String
-    Default: nowart97@gmail.com
+    Default: email@gmail.com
   EmailSubject:
     Type: String
     Default: Reports
