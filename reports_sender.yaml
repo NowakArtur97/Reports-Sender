@@ -45,7 +45,7 @@ Resources:
       SourceArn: !Sub "arn:aws:s3:::${BucketName}"
       SourceAccount: !Ref "AWS::AccountId"
       Principal: s3.amazonaws.com
-  LambdaFunctionRole:
+  ReportsSenderLambdaRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -58,14 +58,13 @@ Resources:
               - sts:AssumeRole
       Path: "/"
       Policies:
-        - PolicyName: LambdaFunctionPolicy
+        - PolicyName: !Sub "${AWS::Region}-ReportsSenderLambdaRole"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                  - s3:DeleteObject
                 Resource: !Sub "arn:aws:s3:::${BucketName}/*"
               - Effect: Allow
                 Action:
@@ -78,7 +77,7 @@ Resources:
       Runtime: python3.9
       Timeout: 60
       Handler: index.lambda_handler
-      Role: !GetAtt LambdaFunctionRole.Arn
+      Role: !GetAtt ReportsSenderLambdaRole.Arn
       Environment:
         Variables:
           SENDER: !Ref SenderEmail
@@ -89,7 +88,6 @@ Resources:
       Code:
         ZipFile: |
           import os.path
-          import json
           import urllib.parse
           import boto3
           import email
@@ -108,10 +106,6 @@ Resources:
           BUCKET = os.environ['BUCKET_NAME']
 
           s3 = boto3.client('s3')
-
-          def clear_bucket():
-              s3.Bucket(BUCKET).objects.all().delete()
-              print("Successfully cleared bucket: " + BUCKET)
 
           def download_report(event):
               KEY = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
@@ -133,7 +127,7 @@ Resources:
               </html>
               """
               CHARSET = "utf-8"
-              client = boto3.client('ses',region_name=aws_region)
+              client = boto3.client('ses', region_name=aws_region)
               msg = MIMEMultipart('mixed')
               msg['Subject'] = subject 
               msg['From'] = sender 
@@ -145,60 +139,49 @@ Resources:
               msg_body.attach(htmlpart)
               att = MIMEApplication(open(file_name, 'rb').read())
               att.add_header('Content-Disposition','attachment', filename="report.csv")
-              if os.path.exists(file_name):
-                  print("File: " + file_name + " exists")
-                  msg.attach(msg_body)
-                  msg.attach(att)
-                  client.send_raw_email(
-                          Source=msg['From'],
-                          Destinations=[
-                              msg['To']
-                          ],
-                          RawMessage={
-                              'Data':msg.as_string(),
-                          }
-                      )
-                  print('Reports sent successfully')
-              else:
-                  message = "File: " + file_name + " does not exist"
-                  print(message)
-                  raise Exception(message)
+              print("File: " + file_name + " exists")
+              msg.attach(msg_body)
+              msg.attach(att)
+              client.send_raw_email(
+                      Source=msg['From'],
+                      Destinations=[
+                          msg['To']
+                      ],
+                      RawMessage={
+                          'Data':msg.as_string(),
+                      }
+                  )
+              print('Report sent successfully')
 
           def lambda_handler(event, context):
               responseData = {}
               attachment = {}
               if 'RequestType' in event:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
                   try:
-                      if event['RequestType'] == 'Delete':
-                          clear_bucket()
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                      attachment = download_report(event)
                   except Exception as e:
-                      print('Exception when setting up the infrastructure')
+                      print('Exception when fetching report from bucket')
                       print(e)
-                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
-              try:
-                  attachment = download_report(event)
-              except Exception as e:
-                  print('Exception when fetching report from bucket')
-                  print(e)
-              try:
-                  for recipient in RECIPIENTS:
-                      send_report(SENDER, recipient, REGION, EMAIL_SUBJECT, attachment)
-              except Exception as e:
-                  print('Exception when sending reports')
-                  print(e)
-  LambdaLogGroup:
+                  try:
+                      for recipient in RECIPIENTS:
+                          send_report(SENDER, recipient, REGION, EMAIL_SUBJECT, attachment)
+                  except Exception as e:
+                      print('Exception when sending reports')
+                      print(e)
+  ReportsSenderLambdaLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${ReportsSenderLambdaFunction}"
       RetentionInDays: !Ref LogRetentionInDays
-  LambdaLogPermissions:
+  ReportsSenderLambdaLogPermissions:
     Type: AWS::IAM::Policy
     DependsOn: ReportsSenderLambdaFunction
     Properties:
       Roles:
-        - !Ref LambdaFunctionRole
-      PolicyName: !Sub "${AWS::Region}-LambdaLogGroup"
+        - !Ref ReportsSenderLambdaRole
+      PolicyName: !Sub "${AWS::Region}-ReportsSenderLambdaLogGroup"
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -211,3 +194,91 @@ Resources:
               - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ReportsSenderLambdaFunction}"
               - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ReportsSenderLambdaFunction}:*"
               - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ReportsSenderLambdaFunction}:*:*"
+  BucketCleanerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::Region}-BucketCleanerLambdaRole"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${BucketName}"
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+  BucketCleanerLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ReportsS3Bucket
+    Properties:
+      Runtime: python3.9
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt BucketCleanerLambdaRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+      Code:
+        ZipFile: |
+          import os.path
+          import boto3
+          import cfnresponse
+
+          print('Loading function')
+
+          BUCKET = os.environ['BUCKET_NAME']
+
+          s3 = boto3.resource('s3')
+
+          def clear_bucket():
+              s3.Bucket(BUCKET).objects.all().delete()
+              print("Successfully cleared bucket: " + BUCKET)
+
+          def lambda_handler(event, context):
+              responseData = {}
+              if event['RequestType'] == 'Delete':
+                  try:
+                      clear_bucket()
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                  except Exception as e:
+                      print('Exception when cleaning bucket: ' + BUCKET)
+                      print(e)
+                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+  BucketCleanerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BucketCleanerLambdaFunction}"
+      RetentionInDays: !Ref LogRetentionInDays
+  BucketCleanerLambdaLogPermissions:
+    Type: AWS::IAM::Policy
+    DependsOn: BucketCleanerLambdaFunction
+    Properties:
+      Roles:
+        - !Ref BucketCleanerLambdaRole
+      PolicyName: !Sub "${AWS::Region}-BucketCleanerLambdaLogGroup"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BucketCleanerLambdaFunction}"
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BucketCleanerLambdaFunction}:*"
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BucketCleanerLambdaFunction}:*:*"
