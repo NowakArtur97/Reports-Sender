@@ -2,23 +2,28 @@ AWSTemplateFormatVersion: 2010-09-09
 Description: Creates an infrastructure for automatically sending reports from S3 to email addresses
 Parameters:
   BucketName:
-    Description: S3 Bucket name
     Type: String
+    Description: S3 Bucket name
     Default: reports-sender-1997
   SenderEmail:
     Type: String
+    Description: Email address of the person sending the reports
     Default: email@gmail.com
   Recipients:
     Type: String
+    Description: Email addresses of report recipients
     Default: email@gmail.com
   EmailSubject:
     Type: String
+    Description: Report email subject
     Default: Reports
   Region:
     Type: String
+    Description: Region where SES emails are located
     Default: eu-central-1
   LogRetentionInDays:
     Type: String
+    Description: Number of log retention days
     Default: 7
 
 Resources:
@@ -91,7 +96,6 @@ Resources:
           import urllib.parse
           import boto3
           import email
-          import cfnresponse
           from botocore.exceptions import ClientError
           from email.mime.multipart import MIMEMultipart
           from email.mime.text import MIMEText
@@ -139,7 +143,6 @@ Resources:
               msg_body.attach(htmlpart)
               att = MIMEApplication(open(file_name, 'rb').read())
               att.add_header('Content-Disposition','attachment', filename="report.csv")
-              print("File: " + file_name + " exists")
               msg.attach(msg_body)
               msg.attach(att)
               client.send_raw_email(
@@ -151,25 +154,21 @@ Resources:
                           'Data':msg.as_string(),
                       }
                   )
-              print('Report sent successfully')
+              print('Report: ' + file_name + ' sent successfully to: ' + recipient)
 
           def lambda_handler(event, context):
-              responseData = {}
               attachment = {}
-              if 'RequestType' in event:
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
-              else:
-                  try:
-                      attachment = download_report(event)
-                  except Exception as e:
-                      print('Exception when fetching report from bucket')
-                      print(e)
-                  try:
-                      for recipient in RECIPIENTS:
-                          send_report(SENDER, recipient, REGION, EMAIL_SUBJECT, attachment)
-                  except Exception as e:
-                      print('Exception when sending reports')
-                      print(e)
+              try:
+                  attachment = download_report(event)
+              except Exception as e:
+                  print('Exception when fetching report from bucket')
+                  print(e)
+              try:
+                  for recipient in RECIPIENTS:
+                      send_report(SENDER, recipient, REGION, EMAIL_SUBJECT, attachment)
+              except Exception as e:
+                  print('Exception when sending reports')
+                  print(e)
   ReportsSenderLambdaLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -219,6 +218,13 @@ Resources:
                 Action:
                   - s3:DeleteObject
                 Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+  BucketCleanerLambdaInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - BucketCleanerLambdaFunction
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt BucketCleanerLambdaFunction.Arn
   BucketCleanerLambdaFunction:
     Type: AWS::Lambda::Function
     DependsOn: ReportsS3Bucket
@@ -258,27 +264,3 @@ Resources:
                       cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
               else:
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
-  BucketCleanerLambdaLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${BucketCleanerLambdaFunction}"
-      RetentionInDays: !Ref LogRetentionInDays
-  BucketCleanerLambdaLogPermissions:
-    Type: AWS::IAM::Policy
-    DependsOn: BucketCleanerLambdaFunction
-    Properties:
-      Roles:
-        - !Ref BucketCleanerLambdaRole
-      PolicyName: !Sub "${AWS::Region}-BucketCleanerLambdaLogGroup"
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Action:
-              - logs:CreateLogGroup
-              - logs:CreateLogStream
-              - logs:PutLogEvents
-            Resource:
-              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BucketCleanerLambdaFunction}"
-              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BucketCleanerLambdaFunction}:*"
-              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BucketCleanerLambdaFunction}:*:*"
